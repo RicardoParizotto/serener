@@ -1,4 +1,3 @@
-```
 ## Compiling and Running Serene on SDE 9.9.1
 
 Follow the instructions compile the code and load the program onto the switch. This will open a command line for you.
@@ -27,4 +26,3 @@ Set the workers nterfaces to promiscuous mode. (This is a workaround that needs 
 After that, you can access the workers and run Serene. Ps: you need to explicitly specify the interface to be used.
 
 sudo python3 client/worker.py 0 --model simple --world_size 2 --out-dir example1 --veth=enp132s0f0np0 straggler --pattern slow_worker --probability 0.15 --min-slowdown 0.5 --max-slowdown 2.0
-```
