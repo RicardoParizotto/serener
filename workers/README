@@ -1,0 +1,5 @@
+Running the aggregation on first server:
+
+sudo python3 client/worker.py 1 --model simple --world_size 2 --out-dir example1 --veth=enp132s0f0np0 --veth2=enp132s0f0np0 straggler --pattern slow_worker --probability 0.15 --min-slowdown 0.5 --max-slowdown 2.0
+
+
