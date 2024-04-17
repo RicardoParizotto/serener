@@ -28,9 +28,11 @@
 #define TYPE_DELFAILURE 4
 
 //#define SYNC 1
-#define ASYNC 1
+//#define ASYNC 1
+#define HYBRID
 
-#define MAX_WORKERS 3
+#define MAX_WORKERS 2
+#define MAX_WORKERS_BITMASK 3    //this one is when the slot is all 1111
 #define BUFFER_SIZE 2
 #define AGGR_ROWS 2485
 //#define AGGR_ROWS 310
@@ -42,6 +44,15 @@
 struct metadata_t {
     bit<32> it;  // metadata example
     bit<32> fail;
+    bit<MAX_WORKERS> bitmask;
+    bit<MAX_WORKERS> buffer_slot;
+    bit<16> low_clock_meta;
+    bit<16> high_clock_meta;
+    bit<16> training_window;
+    bit<MAX_WORKERS> slot_or_bitmask_meta;
+    bit<16> negative_check;   //this will save a variable that i need to check if it is negative
+    bit<16> diff_for_negative_check;
+    bit<16> flushqueue;
 }
 
 // ---------------------------------------------------------------------------
@@ -137,12 +148,19 @@ Register<bit<32>, _>(VALUES_PER_COL) ssp_column_30;
 Register<bit<32>, _>(VALUES_PER_COL) ssp_column_31;
 
 Register<bit<32>, _>(1) clock_counter;
+Register<bit<MAX_WORKERS>, _>(BUFFER_SIZE) ring_buffer;
+Register<bit<16>, _>(1) low_clock;
+Register<bit<16>, _>(1) high_clock;
+Register<bit<16>, _>(1) window_size;
+Register<bit<16>, _>(1) window_copy;
+
+Register<bit<16>, _>(1) compare_clocks;
+Register<bit<16>, _>(1) compare_clocks_2;
 
 
 Register<bit<32>, _>(1) reading;
 Register<bit<32>, _>(1) writing;
 Register<bit<32>, _>(1) iter;
-
 Register<bit<32>, _>(1) debug_worker;
 Register<bit<32>, _>(1) debug_worker1;
 Register<bit<16>, _>(1) debug_worker2;
@@ -194,7 +212,6 @@ control SwitchIngress(
         inout ingress_intrinsic_metadata_for_tm_t ig_intr_tm_md) {
 
 
-
     #include "aggregation.p4"
 
     RegisterAction<bit<32>, _, bit<32>>(sim_failure) read_sim_failure = {
@@ -220,16 +237,6 @@ control SwitchIngress(
         value = hdr.ssp.workerId;
     }
     };
-
-     
-    RegisterAction<bit<32>, _, bit<32>>(clock_counter) update_clock_counter = {
-    void apply(inout bit<32> value, out bit<32> rv){
-    	    if(value == 1) value = 0;
-    	    else value = 1;
-    	    rv = value;
-    }
-    };
-    
     
      
     RegisterAction<bit<32>, _, bit<32>>(reading) read_counter = {
@@ -242,6 +249,14 @@ control SwitchIngress(
     RegisterAction<bit<32>, _, bit<32>>(writing) write_counter = {
     void apply(inout bit<32> value, out bit<32> rv){
     	    value = value + 1;
+    }
+    };
+
+    RegisterAction<bit<32>, _, bit<32>>(ring_buffer) write_buffer = {
+    void apply(inout bit<32> value, out bit<32> rv){
+            if(value == BUFFER_SIZE - 1) value = 0;
+	    else value = value + 1;
+            rv = value;
     }
     };
     
@@ -273,6 +288,106 @@ control SwitchIngress(
     }
 
 
+    //clock counter is the ring buffer.
+    RegisterAction<bit<MAX_WORKERS>, _, bit<MAX_WORKERS>>(clock_counter) update_clock_counter = {
+    void apply(inout bit<MAX_WORKERS> value, out bit<MAX_WORKERS> rv){
+            //if all workers already passed this iteration, reset the slot
+            if(value == MAX_WORKERS_BITMASK)
+                value = ig_md.bitmask;
+            else
+                value = value | ig_md.bitmask;
+	    rv = value;
+    }
+    };
+
+   RegisterAction<bit<16>, _, bit<16>>(window_size) action_compare_window = {
+    void apply(inout bit<16> value, out bit<16> rv){
+             if(ig_md.diff_for_negative_check > value)
+                 rv = 1;          //enqueue and drop  
+             else
+                 rv = 0;          //volta
+    }
+    };
+
+   RegisterAction<bit<16>, _, bit<16>>(window_copy) action_compare_window_copy = {
+    void apply(inout bit<16> value, out bit<16> rv){
+             if(ig_md.diff_for_negative_check > value)
+                 rv = 0;          //set meta flush to 1
+             else
+                 rv = 1;          //set meta flush to 0
+    }
+    };
+
+/*
+   RegisterAction<bit<16>, _, bit<16>>(compare_clocks_2) action_compare_clocks_2 = {
+    void apply(inout bit<16> value, out bit<16> rv){
+             rv = diff_clock_bariers | ((bit<16>) 32767);	
+    }
+    };*/
+    
+   RegisterAction<bit<16>, _, bit<16>>(low_clock) update_low_clock = {
+    void apply(inout bit<16> value, out bit<16> rv){
+                 value = hdr.ssp.workerClock;	
+    }
+    };
+    
+   RegisterAction<bit<16>, _, bit<16>>(high_clock) update_high_clock = {
+    void apply(inout bit<16> value, out bit<16> rv){
+                 if(hdr.ssp.workerClock > value){
+                      value = hdr.ssp.workerClock;
+                 }
+          rv = value;
+    }
+    };
+
+    action set_bitmask(bit<MAX_WORKERS> value){
+        ig_md.bitmask = value;    //1 --- 1, 2 --- 2, 3 --- 4, 4 --- 8
+    }
+
+    action set_window(bit<16> window){
+        ig_md.training_window = window;
+    }
+ 
+
+    //maps ID to an integer in which the only the IDth element is 
+    table map_worker_bitmask {
+        key = {
+            hdr.ssp.workerId:exact;
+        }
+	actions = {
+	    set_bitmask;
+        }
+    }
+
+    action set_flushqueue(){
+        ig_md.flushqueue = 1;
+        ig_intr_tm_md.mcast_grp_a =  1;
+    }
+
+    table table_check_negative {
+        key = {
+            ig_md.negative_check:exact;  //65535 magical value - if it matches it is a negative number: clock is outside window. Drop packet
+        }
+        actions = {
+             drop_;
+        }
+    }
+
+    table table_check_negative_2 {
+        key = {
+            ig_md.negative_check:exact;  //65535 magical value - if it matches it is a negative number: clock is outside window. Drop packet
+        }
+        actions = {
+             set_flushqueue;
+             drop_;
+        }
+    }
+
+    table set_window_table {
+        key = {}
+        actions = {set_window;}
+    }
+
     table ipv4_lpm {
         key = {
             hdr.ipv4.dst_addr: exact;
@@ -285,6 +400,7 @@ control SwitchIngress(
         default_action = drop_();
     }
 
+    
 
     apply {
 
@@ -366,6 +482,34 @@ control SwitchIngress(
 	            bounce_pkt();
 	            read_counter.execute(0);         	      	            
 	        }else if (hdr.ssp.actionCode == SSP_ACTION_CLOCK){
+	            #ifdef HYBRID
+                    bit<32> update_slot = (bit<32>) hdr.ssp.workerClock & (BUFFER_SIZE - 1);
+                    map_worker_bitmask.apply();
+		    ig_md.buffer_slot = update_clock_counter.execute(update_slot);
+
+                    //in case all the workers completed the slot-th iteration
+                    if(ig_md.buffer_slot == MAX_WORKERS_BITMASK){
+                        ig_md.low_clock_meta = update_low_clock.execute(0);
+                    }else{
+			ig_md.high_clock_meta = update_high_clock.execute(0);
+                    }
+
+                    //set flushqueue in case there was an update in the low clock
+                    if(ig_md.buffer_slot == MAX_WORKERS_BITMASK){
+                        ig_md.diff_for_negative_check = ig_md.high_clock_meta - ig_md.low_clock_meta;
+                        ig_md.flushqueue = action_compare_window_copy.execute(0);
+                    }
+
+                    ig_md.diff_for_negative_check  = (bit<16>) hdr.ssp.workerClock - ig_md.low_clock_meta;
+
+                    ig_md.diff_for_negative_check = action_compare_window.execute(0);
+
+                    if(ig_md.diff_for_negative_check == (bit<16>)1)
+                        drop_();  //TODO: enqueue
+                    else
+                        bounce_pkt();
+
+                    #endif
 	            #ifdef SYNC
                     ig_md.it = update_clock_counter.execute(0);
 	            if (ig_md.it == 0){
@@ -381,7 +525,7 @@ control SwitchIngress(
                 //ends aggregation
 	}else{
             if(hdr.ipv4.isValid()){
-            ipv4_lpm.apply();
+                ipv4_lpm.apply();
             }   
         }
 	ig_md.fail = read_sim_failure.execute(0);
