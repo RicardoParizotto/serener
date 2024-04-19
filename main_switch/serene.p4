@@ -38,10 +38,14 @@
 //#define VALUES_PER_COL 310
 #define VALUES_PER_COL 2485
 
+#define SYNCHRONOUS 1
+#define ASYNCHRONOUS 2
+
 
 struct metadata_t {
     bit<32> it;  // metadata example
     bit<32> fail;
+    bit<32> sync_mode;
 }
 
 // ---------------------------------------------------------------------------
@@ -137,7 +141,6 @@ Register<bit<32>, _>(VALUES_PER_COL) ssp_column_30;
 Register<bit<32>, _>(VALUES_PER_COL) ssp_column_31;
 
 Register<bit<32>, _>(1) clock_counter;
-
 
 Register<bit<32>, _>(1) reading;
 Register<bit<32>, _>(1) writing;
@@ -285,6 +288,18 @@ control SwitchIngress(
         default_action = drop_();
     }
 
+    action action_sync_mode(bit<32> mode) {
+        ig_md.sync_mode = mode;
+    }
+
+    table sync_mode{
+        key = {}
+        actions = { 
+            action_sync_mode;
+        }
+        size = 1;
+    }
+
 
     apply {
 
@@ -365,18 +380,17 @@ control SwitchIngress(
 	            hdr.data.value31 = read_column_31.execute(hdr.ssp.gradSegment);	   
 	            bounce_pkt();
 	            read_counter.execute(0);         	      	            
-	        }else if (hdr.ssp.actionCode == SSP_ACTION_CLOCK){
-	            #ifdef SYNC
-                    ig_md.it = update_clock_counter.execute(0);
-	            if (ig_md.it == 0){
-	            	ig_intr_tm_md.mcast_grp_a =  1; //multicast to group1
-	            }else{ 
-	                drop_();
-	            }
-		    #endif
-		    #ifdef ASYNC
-		    ig_intr_tm_md.mcast_grp_a =  1; //multicast to group1
-                    #endif	
+	        }else if (hdr.ssp.actionCode == SSP_ACTION_CLOCK){	           
+                    if(ig_md.sync_mode == SYNCHRONOUS){
+		            ig_md.it = update_clock_counter.execute(0);
+			    if (ig_md.it == 0){
+			    	ig_intr_tm_md.mcast_grp_a =  1; //multicast to group1
+			    }else{ 
+			        drop_();
+			    }
+		    }else{
+		         ig_intr_tm_md.mcast_grp_a =  1; //multicast to group1
+                    }	
 	        } 
                 //ends aggregation
 	}else{
